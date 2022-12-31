@@ -1,0 +1,926 @@
+---
+title: "Space-Time Smoothing for Estimation of Regional Trends in Binge Drinking: Washington State BRFSS 2011-18"
+author: "Matthew Dekker, University of Washington"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    toc_float: true
+---
+
+```{r setup, include = F}
+knitr::opts_chunk$set(warning = F, message = F)
+```
+
+
+```{r svy_psu, echo = F, warning = F}
+if(!require(pacman)){install.packages("pacman")}
+
+#install INLA package if not already installed
+if(!require(INLA)){install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)}
+
+
+# install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+
+pacman::p_load(tidyverse,
+       survey,
+       SUMMER,
+       spdep,
+       viridis,
+       rgdal,
+       readstata13)
+options(survey.lonely.psu = "adjust")
+```
+
+```{r code_core, echo = F, results = F, message = F, warning = F, cache = T}
+#data folder
+data_folder <- "C:/Users/gospe/Documents/Data"
+
+# Load washington state brfss data
+brfss_wa <- read.dta13(paste(data_folder, 
+                             "/WA_BRFSS_11to18/Data/wa_brfss_11to18.dta",
+                             sep = "/"))
+
+# Check minimum number of responses by county year
+brfss_wa %>%
+  group_by(year, `_impcty`) %>%
+  summarise("N" = n()) %>%
+  group_by(`_impcty`) %>%
+  summarise("min" = min(N))
+
+# Read shapefile of WA counties
+wa_counties <- readOGR(paste(data_folder,
+                             "WA_County_Boundaries",
+                             sep = "/"))
+
+# Create county_code variable for linking shapefile with BRFSS data
+wa_counties$county_code <- str_sub(wa_counties$JURISDIC_5, 4, 5) %>%
+  as.numeric()
+
+# Define neighbor counties using "queen" (all adjacent) criteria
+wa_nb <- poly2nb(wa_counties,
+                 queen = T,
+                 row.names = wa_counties$county_code)
+
+# Convert neighbor definitions to matrix 
+wa_mat <- nb2mat(wa_nb, zero.policy = T)
+
+colnames(wa_mat) <- rownames(wa_mat)
+
+mat <- as.matrix(wa_mat[1:dim(wa_mat)[1], 1:dim(wa_mat)[1]])
+
+# Create smaller subset data set
+brfss_short <- brfss_wa %>%
+  filter(!is.na(use_wt), #can't be missing following variables
+         !is.na(`_rfbing5`),
+         !is.na(`_impcty`),
+         !is.na(`_ststr`)) %>%
+  select(`_impcty`, use_wt, `_ststr`, `_rfbing5`, year) %>%
+  mutate("binge" = (na_if(`_rfbing5`, 9))-1) %>%
+  filter(!is.na(binge))
+
+# Allow for single unit PSU - avoids error in survey weighting
+options(survey.lonely.psu = "adjust")
+
+# Create space time smoothed model with survey weights
+svy_smooth_yr <- fitGeneric(data = brfss_short, 
+                            geo = wa_counties,
+                            Amat = mat, 
+                            responseType = "binary",
+                            responseVar = "binge",
+                            strataVar = "_ststr", 
+                            weightVar = "use_wt", 
+                            regionVar = "_impcty",
+                            clusterVar = "~1", 
+                            timeVar = "year",
+                            time.model = "rw1",
+                            type.st = 1)
+
+# Create new variable from smoothed estimates
+smooth <- svy_smooth_yr$smooth
+
+# Define ID for linking geo data with BRFSS
+wa_counties$id <- row.names(wa_counties@data)
+
+# Convert to data.frame for easier mapping/manipulation
+counties_df <- broom::tidy(wa_counties) %>%
+  left_join(wa_counties@data) #join with data
+
+# Aggregate county level data
+cnty_totl <- brfss_short %>%
+  group_by(`_impcty`) %>%
+  summarise("N" = n())
+
+# Merge shape data and county level aggregate data
+counties_df <- merge(counties_df, cnty_totl, by.x = "county_code", by.y = "_impcty")
+
+counties_df_full <- merge(counties_df, smooth, by.x = "county_code", by.y = "region")
+```
+
+```{r echo = F, results = F, cache = T, eval = T, warning = F, message=F}
+#plot reponse count by county
+resp_count <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = N)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.background = element_rect(fill = "#333333", color = "#333333"),
+        strip.text.x = element_text(colour = "grey55"),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(title = "Figure 1: Total Response by County: Washington State BRFSS 2011-18")
+
+
+#plot posterior mean
+post_mean <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = mean)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Posterior Mean Prevalence of Binge Drinking (w Survey Wt)",
+       subtitle = "Washington State BRFSS: 2011-2018")
+
+#plot size of credible intervals
+counties_df_full$ci_size <- counties_df_full$upper - counties_df_full$lower
+
+cred_int <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = ci_size)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "Width",
+       title = "Figure 6: Credible Interval Width (97.5%-2.5%) by County and Year")
+
+  # labs(x = "",
+  #      y = "",
+  #      fill = "",
+  #      title = "Posterior Mean Prevalence of Binge Drinking (w Survey Wt)",
+  #      subtitle = "Washington State BRFSS: 2011-2018",
+  #      caption = "Author: Matthew Dekker (mdekker@uw.edu), Geometries: Washington Department of Natural Resource GIS Open Data")
+
+post_mean_svy <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = upper)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Figure 4: Smoothed Posterior Mean Prevalence of Binge Drinking by County")
+
+
+
+svy_counties <- svydesign(ids = ~1, weights = ~use_wt,
+                          strata = ~`_ststr`, data = brfss_short)
+
+crude_means <- svyby(~binge, ~`_impcty`, svy_counties, svymean, na.rm = T)
+
+post_mean_line <- ggplot(smooth, aes(x = time, y = mean)) +
+  geom_line(mapping = aes(group = region)) +
+  theme_minimal() +
+  labs(x = "Year",
+       y = "Posterior Mean Binge Drinking Prevalence")
+
+prev_line <- brfss_short %>%
+  group_by(`_impcty`, year) %>%
+  summarise("binge_prev" = mean(binge, na.rm = T),
+            "N" = n())
+
+plot_prev_line <- ggplot(prev_line, aes(x = year, y = binge_prev)) +
+  geom_line(mapping = aes(group = `_impcty`)) +
+  theme_minimal() +
+  labs(x = "Year",
+       y = "Binge Drinking Prevalence")
+
+
+# smooth %>%
+#   group_by(region, time) %>%
+#   summarise("Mean" = mean) %>%
+#   spread(time, Mean) %>%
+#   mutate("diff11_18" = `2011` - `2018`,
+#          "")
+
+##Discussion
+# County Attributes
+county_nums <- "1  =  Adams
+3  =  Asotin
+5  =  Benton
+7  =  Chelan
+9  =  Clallam
+11  =  Clark
+13  =  Columbia
+15  =  Cowlitz
+17  =  Douglas
+19  =  Ferry
+21  =  Franklin
+23  =  Garfield
+25  =  Grant
+27  =  Grays Harbor
+29  =  Island
+31  =  Jefferson
+33  =  King
+35  =  Kitsap
+37  =  Kittitas	
+39  =  Klickitat 
+41  =  Lewis
+43  =  Lincoln
+45  =  Mason
+47  =  Okanogan
+49  =  Pacific
+51  =  Pend Oreille
+53  =  Pierce
+55  =  San Juan
+57  =  Skagit
+59  =  Skamania
+61  =  Snohomish
+63  =  Spokane
+65  =  Stevens
+67  =  Thurston
+69  =  Wahkiakum
+71  =  Walla Walla
+73  =  Whatcom
+75  =  Whitman
+77  =  Yakima"
+
+
+county_names <- str_split(county_nums, "\n") %>%
+  unlist() %>%
+  str_sub(start = 5) %>%
+  str_replace_all("=", "") %>%
+  str_trim(side = "left")
+
+county_total <- brfss_short %>%
+  group_by(`_impcty`) %>%
+  summarise("Total" = n())
+
+county_yr_totals <- brfss_short %>%
+  group_by(year, `_impcty`) %>%
+  summarise("N" = n()) %>%
+  spread(year, N) %>%
+  mutate("County" = county_names) %>%
+  select(County, everything(), - `_impcty`) %>%
+  mutate("Total" = county_total$Total)
+
+#write.csv(county_yr_totals, file = "/Users/apple/Documents/School - UW PhD/2_WI 20/EPI 555/Project/county_years.csv")
+
+# smooth %>%
+#   group_by(region, year)
+  
+
+counties_df_full %>%
+  select(JURISDIC_3, time, ci_size, mean) %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  group_by(JURISDIC_3) %>%
+  rename("County" = JURISDIC_3,
+         "Year" = time,
+         "CI_Width" = ci_size,
+         "Post. Mean" = mean)
+  
+counties_df_full %>%
+  select(JURISDIC_3, time, ci_size, mean) %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  group_by(JURISDIC_3) %>%
+  summarise("Correlation" = cor(ci_size, mean, use = "pairwise.complete.obs"))
+
+
+# counties_df_full %>%
+#   select(JURISDIC_3, time, ci_size, mean, lower) %>%
+
+#   group_by(JURISDIC_3, time) %>%
+#   slice(1) %>%
+#   ggplot(aes(x = mean, y = lower)) +
+#   geom_point(mapping = aes(color = JURISDIC_3))
+
+#decrease in prevalence 2011-2018
+post_mean_change <- smooth %>%
+  select(region, time, mean) %>%
+  group_by(region) %>%
+  spread(time, mean) %>%
+  mutate("Change" = `2011` - `2018`)
+  
+post_mean_change_plot <- ggplot(post_mean_change, aes(x = `2011`, y = Change)) +
+  geom_point() +
+  theme_minimal() +
+  geom_smooth(method = "loess", se = T) +
+  labs(x = "Posterior Mean 2011",
+       y = "Change 2011-2018",
+       title = "Figure 5: Association between 2011 Posterior Mean Prevalence and Absolute Change 2011-2018")
+  
+  
+counties_df_full %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  select(JURISDIC_3, time, mean, ci_size)
+```
+
+<div class = "row">
+
+<div class = "col-md-4">
+```{r inline_plot1, echo = F, cache = T}
+plot_prev_line +
+  labs(x = "",
+       y = "")
+```
+</div>
+
+<div class = "col-md-4">
+```{r inline_plot2, echo = F, cache = T}
+post_mean_line +
+  labs(x = "",
+       y = "")
+```
+</div>
+
+<div class = "col-md-4">
+```{r inline_plot3, echo = F, cache = T}
+post_mean +
+  theme(legend.position = "none")
+```
+</div>
+</div>
+
+# PLAIN ENGLISH SUMMARY
+
+__Problem__
+
+A common issue encountered in public policy is data not being sufficient to answer a particular question. Frequently, this looks like decision makers wanting to break data down by subgroups when the numbers in those subgroups are too small to be reliable. 
+
+__Potential Solution__
+
+In statistics we regularly look to apply reasonable assumptions about our data in order to improve estimates. A common example of this is that if a measurement is taken from a person or an area frequently over time, you would generally expect measurements taken closer together in time to be similar. The further away two measurements are, the less similar they are likely to be. We can often make a similar assumption about geography. For example, two counties that are neighboring are likely to be more similar than two counties on opposite ends of a large state. 
+
+In certain circumstances, we can use assumptions about time and space to make estimates about smaller areas than we may be able to otherwise. These techniques, known collectively as Small Area Estimation, can offer applied researchers an important additional tool for producing data to support crucial decision making.
+
+__Present Example__
+
+This analysis serves as a motivating example of these methods by using assumptions about time and space to estimate trends in binge drinking by county in Washington State. Traditional statistical approaches provided clearly unreliable estimates of the year-to-year trends for smaller counties. However, when using a Small Area Estimation approach, the reliability of the estimated trends improved considerably, especially in smaller counties. 
+
+There was a consistent decrease in binge drinking prevalence in all Washington counties from 2011-2018. King, Snohomish, and Clark counties experienced the largest decreases of around three percentage points for each, while Garfield, Klickitat, and Columbia experienced the smallest of approximately one and a half percentage points each. 
+
+Better and more detailed data is almost always the ideal solution to making estimates about small areas. However, with many organizations lacking the funding and resources to collect such data, Small Area Estimation can provide maximum utilization of available data in many such situations.
+
+***
+
+# INTRODUCTION
+Excess alcohol consumption has been linked to a variety of poor health outcomes including increased incidence of cardiovascular disease (Holmes et al., 2014; Piano, 2017), certain cancers (Bagnardi, Blangiardo, La Vecchia, & Corrao, 2001; Boffetta & Hashibe, 2006), and liver disease (Parker et al., 2019). In a recent nationally representative survey, roughly a quarter of US adult respondents reported having engaged in binge drinking (>= 5 drinks in one sitting for males, >= 4 for females) in the previous month (Substance Abuse and Mental Health Services Administration, 2019), and considerable regional variability has been shown in similar estimates (Centers for Disease Control and Prevention, 2015). Additionally, binge drinking appears to be increasing in the US with several separate estimates showing a positive year-over-year trend (Grucza et al., 2018).
+
+Despite the fact that there are thought to be meaningful trends spatially as well as temporally in binge drinking, little previous research has sought to elucidate spatial variability in temporal trends in binge drinking, and the few studies that do tend to focus on state level trends (Kanny, Naimi, Liu, & Brewer, 2020; LaVallee, Kim, & Yi, 2014), likely due in part to small area-by-year numbers. Evaluating changes in smaller regional areas is important, however, as these areas may better characterize health producing systems (Karpati, Galea, Awerbuch, & Levins, 2002; Levins & Lopez, 1999).
+
+This study sought to estimate the spatial variability in temporal binge drinking trends from the years 2011 to 2018 using data from the Washington State Behavioral Risk Factor Surveillance System. Bayesian spatio-temporal smooth was used to decrease the uncertainty of estimates posed by small numbers in areas by year by exploiting spatial and temporal structures in the data. 
+
+
+# METHODS
+
+### Data
+The Washington State Behavioral Risk Factor Surveillance System (BRFSS; Washington State Department of Health, 2019), is a an annual cross-sectional phone survey of Washington State residents in order to collect data on a wide spectrum of health factors. Annual data were collected from the years 2011 through 2018. BRFSS data are publicly available by request at https://fortress.wa.gov/doh/opinio/s?s=BRFSSDataOrderForm. 
+
+County shapefiles were acquired from The Washington Department of Natural Resources (DNR) GIS Open Data at http://data-wadnr.opendata.arcgis.com/datasets/wa-county-boundaries. Consistent with Washington State standards, DNR shapefiles utilize Lambert Conic Conformal projection and Washington State Plane Coordinates.
+
+### Weighting
+BRFSS utilizes a complex sampling scheme in order to estimate relevant population level estimates. In order to produce valid estimates a complex methodology known as raking, or iterative proportional fitting, is utilized to weight responses using a variety of demographic variables as well as phone type (cell phone or landline; Pierannunzi, Town, Garvin, Shaw, & Balluz, 2012). Provided weight and sampling stratum variables were incorporated into analyses using the Survey package (Lumley, 2004) in R software (R Core Team, 2019).  
+
+### Variables
+Binge drinking was defined in BRFSS using the National Institute of Alcohol Abuse and Alcoholism definition of five or more drinks in one sitting for males or four or more drinks in one sitting for females (National Institute on Alcohol Abuse and Alcoholism, 2004). County of residence was determined primarily by self-reported zip code or from the individual’s sampling stratum. If no information was available for either zip code or sampling stratum, individuals were assigned to the most populous county in Washington (King County). 
+
+### Exclusion Criteria
+Individuals were excluded from analysis if variables for binge drinking, survey weight or survey stratum were missing. 	
+
+### Statistical Analysis
+In order to calculate valid prevalence trajectories by county, spatio-temporal smoothing was applied accounting for survey weighting using the SUMMER package in R (Mercer et al., 2015) which utilizes Integrated Nested Laplace Approximation as a computationally efficient method for hierarchical Bayesian analysis. Spatial smoothing utilized a BYM2 model which decomposes random effects into spatial and non-spatial components (Best, Richardson, & Thomson, 2005) by incorporating information from immediate neighboring regions to construct the prior distribution. A first order random walk approach was utilized for temporal smoothing, incorporating immediately adjacent time periods to inform the priors.  Additionally, a space-time interaction term was included in the model to allow for different temporal trajectories in binge drinking prevalence by county. 
+
+
+```{r figure_1, echo = F, out.width = "65%", out.width= "65%", out.extra='style="float:right; padding:10px"'}
+
+resp_count 
+```
+
+# RESULTS
+In total, there was a considerable amount of variability in the number of total responses as would be expected with differing underlying population sizes (Figure 1). King County had the most responses (25,607; mean yearly response – 5,690.4) and Ferry County the least (319; mean yearly response – 70.9). The mean number of total response by county was 2,654.5. After applying smoothing there was a considerable decrease in the amount of temporal variability in binge drinking estimates, using the posterior mean in the smoothed Bayesian model (Figures 2 & 3).
+
+```{r figure_2, echo = F, cache = T, out.width = "50%", fig.show = 'hold'}
+plot_prev_line +
+  labs(title = "Figure 2: Unsmoothed Change in Binge Drinking Prevalence by Year")
+
+post_mean_line +
+  labs(title = "Figure 3: Smoothed Posterior Mean Binge Drinking Prevalence by Year")
+```
+
+
+```{r post_mean_svy, echo = F, out.width = "65%", out.width= "65%", out.extra='style="float:right; padding:10px"', cache = F}
+
+post_mean_svy
+
+```
+
+For all counties, there was a meaningful decrease in binge drinking prevalence across the observation period (Figure 4).  The largest increases were observed in King (-.032), Snohomish (-.029) and Clark (-.027) counties and the smallest in Garfield (-.013), Klickitat (-.013), and Columbia (-.014), with a strong linear trend apparent in the amount of change and the estimated posterior mean binge drinking prevalence at baseline (2011; Figure 5). There were modest differences in uncertainty, with credible interval widths ranging from King County, 2011 (.027) to Pend Oreille County, 2011 (.075), and overall there was a decrease in the width of credible intervals with subsequent years (Figure 6).
+
+```{r figure_5_6, echo = F, message = F, warning = F, cache = T, out.width = "50%", fig.show = 'hold'}
+post_mean_change_plot
+
+cred_int
+```
+
+# DISCUSSION
+Binge drinking continues to represent a considerable burden on population health throughout the United States as well as in Washington state specifically. While regional estimates of binge drinking can be impeded by small numbers, this difficulty is magnified in attempting to estimate year-over-year trends which may provide important information about health producing mechanisms as well as changing needs in healthcare access. By making assumptions about the spatial and temporal structure of our data, we were able to decrease uncertainty of these estimates. Counties in Washington State seemed to experience similar absolute levels in decline of binge drinking, with minimal meaningful variability having been observed in any particular county despite differences in estimated baseline prevalence of binge drinking. Though this study has made meaningful contributions to the literature in terms of providing estimates and methodology for county level trends in binge drinking, there are important limitations to note.
+
+1. Though likely better than states for many outcomes, it is unclear the degree to which counties represent meaningful spatial units and by extension the degree to which spatial dependence differs by county. It is likely that smaller counties demonstrate more spatial similarities to their neighbors than larger counties due to smaller absolute distances from all individuals in those counties to neighboring counties. Additionally, more sociodemographically homogenous counties are likely to be more similar to their neighbors, as it is unlikely that such homogeneity ends at county lines.
+
+2. BRFSS may still face issues of selection bias, despite efforts to account for which through sampling methodology. Currently BRFSS is only available to either English or Spanish speaking participants, thus a small proportion of the population may be systematically excluded.  
+
+3.	This study was unable to systematically evaluate spatial dependence of the data due to the sophistication of evaluation such using complex survey data, and key assumptions regarding the spatial structure of the data may have been violated.
+
+Future research would benefit from more critical analysis of the appropriateness of fit between health generating systems and different spatial level of analyses. Previous work has suggested that neighborhood level dynamics may be important determinants of health (Diez Roux & Mair, 2010; Dragan, Ellen, & Glied, 2019), but it is unclear if those results hold when comparing geographic regions. Additional work may also benefit from applying similar methodology to outcomes with similar spatial trends such as smoking and HIV (Karpati et al., 2002). Lastly, several modelling decisions were made based on simplicity rather than ultimate utility. Future studies ought to explore the use of more sophisticated spatial and temporal modelling such as more complex spatial weighting and second order random walk models.
+
+
+# REFERENCES
+
+<details>
+  <summary> Click to Expand References </summary>
+  
+Bagnardi, V., Blangiardo, M., La Vecchia, C., & Corrao, G. (2001). Alcohol consumption and the risk of cancer: A meta-analysis. Alcohol Research and Health.
+
+Best, N., Richardson, S., & Thomson, A. (2005). A comparison of Bayesian spatial models for disease mapping. Statistical Methods in Medical Research. https://doi.org/10.1191/0962280205sm388oa
+
+Boffetta, P., & Hashibe, M. (2006). Alcohol and cancer. Lancet Oncology. https://doi.org/10.1016/S1470-2045(06)70577-0
+
+Centers for Disease Control and Prevention (CDC). (2015). Behavioral Risk Factor Surveillance System Survey Data.
+
+Diez Roux, A. V., & Mair, C. (2010). Neighborhoods and health. Annals of the New York Academy of Sciences, 1186(1), 125–145. https://doi.org/10.1111/j.1749-6632.2009.05333.x
+
+Dragan, K. L., Ellen, I. G., & Glied, S. A. (2019). Gentrification And The Health Of Low-Income Children In New York City. Health Affairs, 38(9), 1425–1432. https://doi.org/10.1377/hlthaff.2018.05422
+
+Grucza, R. A., Sher, K. J., Kerr, W. C., Krauss, M. J., Lui, C. K., McDowell, Y. E., … Bierut, L. J. (2018). Trends in Adult Alcohol Use and Binge Drinking in the Early 21st-Century United States: A Meta-Analysis of 6 National Survey Series. Alcoholism: Clinical and Experimental Research. https://doi.org/10.1111/acer.13859
+
+Holmes, M. V., Dale, C. E., Zuccolo, L., Silverwood, R. J., Guo, Y., Ye, Z., … Casas, J. P. (2014). Association between alcohol and cardiovascular disease: Mendelian randomisation analysis based on individual participant data. BMJ (Online). https://doi.org/10.1136/bmj.g4164
+
+Kanny, D., Naimi, T. S., Liu, Y., & Brewer, R. D. (2020). Trends in Total Binge Drinks per Adult Who Reported Binge Drinking - United States, 2011-2017. MMWR. Morbidity and Mortality Weekly Report. https://doi.org/10.15585/mmwr.mm6902a2
+
+Karpati, A., Galea, S., Awerbuch, T., & Levins, R. (2002). Variability and vulnerability at the ecological level: Implications for understanding the social determinants of health. American Journal of Public Health. https://doi.org/10.2105/AJPH.92.11.1768
+
+LaVallee, R. A., Kim, T., & Yi, H. (2014). APPARENT PER CAPITA ALCOHOL CONSUMPTION: NATIONAL, STATE, AND REGIONAL TRENDS, 1977–2012.
+
+Levins, R., & Lopez, C. (1999). Toward an ecosocial view of health. International Journal of Health Services. https://doi.org/10.2190/WLVK-D0RR-KVBV-A1DH
+
+Lumley, T. (2004). Analysis of complex survey samples. Journal of Statistical Software. https://doi.org/10.18637/jss.v009.i08
+
+Mercer, L. D., Wakefield, J., Pantazis, A., Lutambi, A. M., Masanja, H., & Clark, S. (2015). Space–time smoothing of complex survey data: Small area estimation for child mortality. Annals of Applied Statistics. https://doi.org/10.1214/15-AOAS872
+
+National Institute on Alcohol Abuse and Alcoholism. (2004). NIAAA Council Approves Definition of Binge Drinking. NIAAA Newsletter.
+
+Parker, R., Aithal, G. P., Becker, U., Gleeson, D., Masson, S., Wyatt, J. I., & Rowe, I. A. (2019). Natural history of histologically proven alcohol-related liver disease: A systematic review. Journal of Hepatology. https://doi.org/10.1016/j.jhep.2019.05.020
+
+Piano, M. R. (2017). Alcohol’s Effects on the Cardiovascular System. Alcohol Research : Current Reviews.
+
+Pierannunzi, C., Town, M., Garvin, W., Shaw, F. E., & Balluz, L. (2012). Methodologic changes in the Behavioral Risk Factor Surveillance System in 2011 and potential effects on prevalence estimates. Morbidity and Mortality Weekly Report.
+
+R Core Team. (2019). R: A Language and Environment for Statistical Computing. Vienna, Austria.
+
+Substance Abuse and Mental Health Services Administration. (2019). Key substance use and mental health indicators in the United States: Results from the 2018 National Survey on Drug Use and Health. HHS Publication No. PEP19-5068, NSDUH Series H-54. https://doi.org/10.1016/j.drugalcdep.2016.10.042
+
+Washington State Department of Health. (2019). Behavioral Risk Factor Surveillance System.
+  
+</details>
+
+# *Code Appendix*
+
+<details>
+  <summary> Click to Code Appendix </summary>
+
+```{r svy_psu2, echo = T, warning = F, eval = F}
+if(!require(pacman)){install.packages("pacman")}
+
+#install INLA package if not already installed
+if(!require(INLA)){install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)}
+
+
+# install.packages("INLA",repos=c(getOption("repos"),INLA="https://inla.r-inla-download.org/R/stable"), dep=TRUE)
+
+pacman::p_load(tidyverse,
+       survey,
+       SUMMER,
+       spdep,
+       viridis,
+       rgdal,
+       readstata13)
+options(survey.lonely.psu = "adjust")
+```
+
+```{r code_core2, echo = T, results = F, message = F, warning = F, cache = T, eval = F}
+#data folder
+data_folder <- "C:/Users/gospe/Documents/Data"
+
+# Load washington state brfss data
+brfss_wa <- read.dta13(paste(data_folder, 
+                             "/WA_BRFSS_11to18/Data/wa_brfss_11to18.dta",
+                             sep = "/"))
+
+# Check minimum number of responses by county year
+brfss_wa %>%
+  group_by(year, `_impcty`) %>%
+  summarise("N" = n()) %>%
+  group_by(`_impcty`) %>%
+  summarise("min" = min(N))
+
+# Read shapefile of WA counties
+wa_counties <- readOGR(paste(data_folder,
+                             "WA_County_Boundaries",
+                             sep = "/"))
+
+# Create county_code variable for linking shapefile with BRFSS data
+wa_counties$county_code <- str_sub(wa_counties$JURISDIC_5, 4, 5) %>%
+  as.numeric()
+
+# Define neighbor counties using "queen" (all adjacent) criteria
+wa_nb <- poly2nb(wa_counties,
+                 queen = T,
+                 row.names = wa_counties$county_code)
+
+# Convert neighbor definitions to matrix 
+wa_mat <- nb2mat(wa_nb, zero.policy = T)
+
+colnames(wa_mat) <- rownames(wa_mat)
+
+mat <- as.matrix(wa_mat[1:dim(wa_mat)[1], 1:dim(wa_mat)[1]])
+
+# Create smaller subset data set
+brfss_short <- brfss_wa %>%
+  filter(!is.na(use_wt), #can't be missing following variables
+         !is.na(`_rfbing5`),
+         !is.na(`_impcty`),
+         !is.na(`_ststr`)) %>%
+  select(`_impcty`, use_wt, `_ststr`, `_rfbing5`, year) %>%
+  mutate("binge" = (na_if(`_rfbing5`, 9))-1) %>%
+  filter(!is.na(binge))
+
+# Allow for single unit PSU - avoids error in survey weighting
+options(survey.lonely.psu = "adjust")
+
+# Create space time smoothed model with survey weights
+svy_smooth_yr <- fitGeneric(data = brfss_short, 
+                            geo = wa_counties,
+                            Amat = mat, 
+                            responseType = "binary",
+                            responseVar = "binge",
+                            strataVar = "_ststr", 
+                            weightVar = "use_wt", 
+                            regionVar = "_impcty",
+                            clusterVar = "~1", 
+                            timeVar = "year",
+                            time.model = "rw1",
+                            type.st = 1)
+
+# Create new variable from smoothed estimates
+smooth <- svy_smooth_yr$smooth
+
+# Define ID for linking geo data with BRFSS
+wa_counties$id <- row.names(wa_counties@data)
+
+# Convert to data.frame for easier mapping/manipulation
+counties_df <- broom::tidy(wa_counties) %>%
+  left_join(wa_counties@data) #join with data
+
+# Aggregate county level data
+cnty_totl <- brfss_short %>%
+  group_by(`_impcty`) %>%
+  summarise("N" = n())
+
+# Merge shape data and county level aggregate data
+counties_df <- merge(counties_df, cnty_totl, by.x = "county_code", by.y = "_impcty")
+
+counties_df_full <- merge(counties_df, smooth, by.x = "county_code", by.y = "region")
+```
+
+```{r echo = T, results = F, cache = T, eval = T, warning = F, message=F, eval = F}
+#plot reponse count by county
+resp_count <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = N)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.background = element_rect(fill = "#333333", color = "#333333"),
+        strip.text.x = element_text(colour = "grey55"),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(title = "Figure 1: Total Response by County: Washington State BRFSS 2011-18")
+
+
+#plot posterior mean
+post_mean <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = mean)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Posterior Mean Prevalence of Binge Drinking (w Survey Wt)",
+       subtitle = "Washington State BRFSS: 2011-2018")
+
+#plot size of credible intervals
+counties_df_full$ci_size <- counties_df_full$upper - counties_df_full$lower
+
+cred_int <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = ci_size)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "Width",
+       title = "Figure 6: Credible Interval Width (97.5%-2.5%) by County and Year")
+
+  # labs(x = "",
+  #      y = "",
+  #      fill = "",
+  #      title = "Posterior Mean Prevalence of Binge Drinking (w Survey Wt)",
+  #      subtitle = "Washington State BRFSS: 2011-2018",
+  #      caption = "Author: Matthew Dekker (mdekker@uw.edu), Geometries: Washington Department of Natural Resource GIS Open Data")
+
+post_mean_svy <- ggplot(counties_df_full, aes(x = long, y = lat)) +
+  geom_polygon(mapping = aes(group = group, fill = upper)) +
+  coord_map(projection = "lambert",
+            lat0 = 45.5,
+            lat1 = 47.2) +
+  facet_wrap(~time) +
+  scale_fill_viridis(option = "C") +
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_text(color = "grey50"),
+        # legend.background = element_rect(fill = "#333333"),
+        axis.text.x = element_blank(),
+        axis.text.y = element_blank(),
+        strip.text.x = element_text(colour = "grey55"),
+        axis.title = element_blank(),
+        # plot.title = element_text(color = "white",
+        #                           family = "Helvetica",
+        #                           hjust = 0.5),
+        plot.subtitle = element_text(color = "white",
+                                     family = "Helvetica",
+                                     hjust = 0.5),
+        plot.caption = element_text(size = 7, hjust = .5)) +
+  labs(x = "",
+       y = "",
+       fill = "",
+       title = "Figure 4: Smoothed Posterior Mean Prevalence of Binge Drinking by County")
+
+
+
+svy_counties <- svydesign(ids = ~1, weights = ~use_wt,
+                          strata = ~`_ststr`, data = brfss_short)
+
+crude_means <- svyby(~binge, ~`_impcty`, svy_counties, svymean, na.rm = T)
+
+post_mean_line <- ggplot(smooth, aes(x = time, y = mean)) +
+  geom_line(mapping = aes(group = region)) +
+  theme_minimal() +
+  labs(x = "Year",
+       y = "Posterior Mean Binge Drinking Prevalence")
+
+prev_line <- brfss_short %>%
+  group_by(`_impcty`, year) %>%
+  summarise("binge_prev" = mean(binge, na.rm = T),
+            "N" = n())
+
+plot_prev_line <- ggplot(prev_line, aes(x = year, y = binge_prev)) +
+  geom_line(mapping = aes(group = `_impcty`)) +
+  theme_minimal() +
+  labs(x = "Year",
+       y = "Binge Drinking Prevalence")
+
+
+# smooth %>%
+#   group_by(region, time) %>%
+#   summarise("Mean" = mean) %>%
+#   spread(time, Mean) %>%
+#   mutate("diff11_18" = `2011` - `2018`,
+#          "")
+
+##Discussion
+# County Attributes
+county_nums <- "1  =  Adams
+3  =  Asotin
+5  =  Benton
+7  =  Chelan
+9  =  Clallam
+11  =  Clark
+13  =  Columbia
+15  =  Cowlitz
+17  =  Douglas
+19  =  Ferry
+21  =  Franklin
+23  =  Garfield
+25  =  Grant
+27  =  Grays Harbor
+29  =  Island
+31  =  Jefferson
+33  =  King
+35  =  Kitsap
+37  =  Kittitas	
+39  =  Klickitat 
+41  =  Lewis
+43  =  Lincoln
+45  =  Mason
+47  =  Okanogan
+49  =  Pacific
+51  =  Pend Oreille
+53  =  Pierce
+55  =  San Juan
+57  =  Skagit
+59  =  Skamania
+61  =  Snohomish
+63  =  Spokane
+65  =  Stevens
+67  =  Thurston
+69  =  Wahkiakum
+71  =  Walla Walla
+73  =  Whatcom
+75  =  Whitman
+77  =  Yakima"
+
+
+county_names <- str_split(county_nums, "\n") %>%
+  unlist() %>%
+  str_sub(start = 5) %>%
+  str_replace_all("=", "") %>%
+  str_trim(side = "left")
+
+county_total <- brfss_short %>%
+  group_by(`_impcty`) %>%
+  summarise("Total" = n())
+
+county_yr_totals <- brfss_short %>%
+  group_by(year, `_impcty`) %>%
+  summarise("N" = n()) %>%
+  spread(year, N) %>%
+  mutate("County" = county_names) %>%
+  select(County, everything(), - `_impcty`) %>%
+  mutate("Total" = county_total$Total)
+
+#write.csv(county_yr_totals, file = "/Users/apple/Documents/School - UW PhD/2_WI 20/EPI 555/Project/county_years.csv")
+
+# smooth %>%
+#   group_by(region, year)
+  
+
+counties_df_full %>%
+  select(JURISDIC_3, time, ci_size, mean) %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  group_by(JURISDIC_3) %>%
+  rename("County" = JURISDIC_3,
+         "Year" = time,
+         "CI_Width" = ci_size,
+         "Post. Mean" = mean)
+  
+counties_df_full %>%
+  select(JURISDIC_3, time, ci_size, mean) %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  group_by(JURISDIC_3) %>%
+  summarise("Correlation" = cor(ci_size, mean, use = "pairwise.complete.obs"))
+
+
+# counties_df_full %>%
+#   select(JURISDIC_3, time, ci_size, mean, lower) %>%
+#   group_by(JURISDIC_3, time) %>%
+#   slice(1) %>%
+#   ggplot(aes(x = mean, y = lower)) +
+#   geom_point(mapping = aes(color = JURISDIC_3))
+
+#decrease in prevalence 2011-2018
+post_mean_change <- smooth %>%
+  select(region, time, mean) %>%
+  group_by(region) %>%
+  spread(time, mean) %>%
+  mutate("Change" = `2011` - `2018`)
+  
+post_mean_change_plot <- ggplot(post_mean_change, aes(x = `2011`, y = Change)) +
+  geom_point() +
+  theme_minimal() +
+  geom_smooth(method = "loess", se = T) +
+  labs(x = "Posterior Mean 2011",
+       y = "Change 2011-2018",
+       title = "Figure 5: Association between 2011 Posterior Mean Prevalence and Absolute Change 2011-2018")
+  
+  
+counties_df_full %>%
+  group_by(JURISDIC_3, time) %>%
+  slice(1) %>%
+  select(JURISDIC_3, time, mean, ci_size)
+```
+
+</details>
